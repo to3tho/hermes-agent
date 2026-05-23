@@ -588,6 +588,91 @@ def _list_provider_status(profile_dir: Path) -> Tuple[List[Dict[str, Any]], Opti
 
 
 # ---------------------------------------------------------------------------
+# Usage summary helper (used by /api/usage/summary)
+# ---------------------------------------------------------------------------
+#
+# Aggregates token counts + estimated cost from the sessions
+# table. Pure read; no mutation. Optionally windowed by ISO
+# timestamp via the ``since_iso`` argument. Returns the same
+# shape as the handler ships, so the handler is a thin
+# adapter.
+
+
+def _read_usage_summary(db_path: Path, since_iso: Optional[str] = None) -> Dict[str, Any]:
+    """Read aggregate token + cost data from a sessions DB."""
+    import sqlite3
+
+    where = ""
+    params: List[Any] = []
+    if since_iso:
+        where = "WHERE started_at >= ?"
+        params.append(since_iso)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        try:
+            agg = conn.execute(
+                f"""SELECT
+                    COALESCE(SUM(input_tokens), 0)         AS in_tok,
+                    COALESCE(SUM(output_tokens), 0)        AS out_tok,
+                    COALESCE(SUM(cache_read_tokens), 0)    AS cr_tok,
+                    COALESCE(SUM(cache_write_tokens), 0)   AS cw_tok,
+                    COALESCE(SUM(estimated_cost_usd), 0.0) AS cost,
+                    MIN(started_at)                        AS first_at,
+                    MAX(COALESCE(ended_at, started_at))    AS last_at
+                FROM sessions
+                {where}""",
+                params,
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # Schema mismatch (e.g. a legacy DB without one of the
+            # cache_* columns). Surface an empty summary rather
+            # than a 500.
+            return {
+                "window_start": since_iso,
+                "window_end": None,
+                "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+                "estimated_cost_usd": None,
+                "by_model": [],
+            }
+
+        try:
+            by_model_rows = conn.execute(
+                f"""SELECT model,
+                       COUNT(*) AS requests,
+                       COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens
+                FROM sessions
+                {where}
+                GROUP BY model
+                ORDER BY tokens DESC""",
+                params,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            by_model_rows = []
+
+    by_model = [
+        {
+            "model_id": (row[0] or "unknown"),
+            "requests": int(row[1] or 0),
+            "tokens": int(row[2] or 0),
+        }
+        for row in by_model_rows
+    ]
+    cost_total = float(agg[4] or 0.0)
+    return {
+        "window_start": agg[5],
+        "window_end": agg[6],
+        "tokens": {
+            "input": int(agg[0] or 0),
+            "output": int(agg[1] or 0),
+            "cache_read": int(agg[2] or 0),
+            "cache_write": int(agg[3] or 0),
+        },
+        "estimated_cost_usd": cost_total if cost_total > 0 else None,
+        "by_model": by_model,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CORS middleware
 # ---------------------------------------------------------------------------
 
@@ -1649,6 +1734,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "remote_toolsets": True,
                 "remote_gateway_status": True,
                 "remote_providers": True,
+                "remote_usage_summary": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
@@ -1682,6 +1768,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "bundled_skills": {"method": "GET", "path": "/api/skills/bundled"},
                 "skill_content": {"method": "GET", "path": "/api/skills/content"},
                 "providers": {"method": "GET", "path": "/api/providers"},
+                "usage_summary": {"method": "GET", "path": "/api/usage/summary"},
             },
         })
 
@@ -3347,6 +3434,50 @@ class APIServerAdapter(BasePlatformAdapter):
             return _api_json_error(str(exc), status=500)
 
     # ------------------------------------------------------------------
+    # Usage summary — token + cost aggregates from SessionDB
+    # ------------------------------------------------------------------
+
+    async def _handle_usage_summary(self, request: "web.Request") -> "web.Response":
+        """GET /api/usage/summary — aggregate token + cost usage
+        from the persisted session DB.
+
+        Query params:
+          * ``since`` — ISO timestamp; only sessions started at or
+            after are counted. Omit for all-time totals.
+
+        Response shape: aggregated counts only; per-message detail
+        is intentionally omitted.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        since_iso = request.query.get("since") or None
+        try:
+            profile_dir = _profile_dir_for_request(request)
+            db_path = profile_dir / "state.db"
+            if not db_path.exists():
+                return web.json_response(
+                    {
+                        "window_start": since_iso,
+                        "window_end": None,
+                        "tokens": {
+                            "input": 0,
+                            "output": 0,
+                            "cache_read": 0,
+                            "cache_write": 0,
+                        },
+                        "estimated_cost_usd": None,
+                        "by_model": [],
+                    }
+                )
+            data = _read_usage_summary(db_path, since_iso=since_iso)
+            return web.json_response(data)
+        except Exception as exc:
+            logger.exception("GET /api/usage/summary failed")
+            return _api_json_error(str(exc), status=500)
+
+    # ------------------------------------------------------------------
     # Providers — read-only inventory; never the API keys
     # ------------------------------------------------------------------
 
@@ -4397,6 +4528,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/api/skills/content", self._handle_skill_content)
             # Providers inventory (no keys, just configured flags)
             self._app.router.add_get("/api/providers", self._handle_list_providers)
+            # Usage summary aggregates (token + cost)
+            self._app.router.add_get("/api/usage/summary", self._handle_usage_summary)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
