@@ -971,6 +971,14 @@ except ImportError:
     _cron_trigger = None
 
 
+_KANBAN_AVAILABLE = False
+try:
+    from hermes_cli import kanban_db as _kanban_db
+    _KANBAN_AVAILABLE = True
+except ImportError:
+    _kanban_db = None  # type: ignore[assignment]
+
+
 MEMORY_ENTRY_DELIMITER = "\n\u00a7\n"
 MEMORY_CHAR_LIMIT = 2200
 USER_PROFILE_CHAR_LIMIT = 1375
@@ -1858,6 +1866,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "remote_providers": True,
                 "remote_usage_summary": True,
                 "remote_recent_events": True,
+                "remote_kanban": _KANBAN_AVAILABLE,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
@@ -1893,6 +1902,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "providers": {"method": "GET", "path": "/api/providers"},
                 "usage_summary": {"method": "GET", "path": "/api/usage/summary"},
                 "recent_events": {"method": "GET", "path": "/api/events/recent"},
+                "kanban_boards": {"method": "GET/POST", "path": "/api/kanban/boards"},
+                "kanban_board_delete": {"method": "DELETE", "path": "/api/kanban/boards/{slug}"},
+                "kanban_tasks": {"method": "GET/POST", "path": "/api/kanban/tasks"},
+                "kanban_task_delete": {"method": "DELETE", "path": "/api/kanban/tasks/{task_id}"},
+                "kanban_task_complete": {"method": "POST", "path": "/api/kanban/tasks/{task_id}/complete"},
             },
         })
 
@@ -3672,6 +3686,312 @@ class APIServerAdapter(BasePlatformAdapter):
             return _api_json_error(str(exc), status=500)
 
     # ------------------------------------------------------------------
+    # Kanban — boards + tasks, light CRUD surface
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_kanban_available() -> Optional["web.Response"]:
+        if not _KANBAN_AVAILABLE:
+            return web.json_response(
+                {"error": "Kanban subsystem not available"}, status=501,
+            )
+        return None
+
+    @staticmethod
+    def _serialise_kanban_task(task: "Any") -> Dict[str, Any]:
+        """Flatten a kanban_db.Task dataclass to a JSON-safe dict.
+
+        Includes the task body verbatim — kanban tasks are user-authored
+        plain prose by design (titles, body, result). Sanitisation is
+        the responsibility of the response middleware on the
+        identity-bearing endpoints (memory, sessions), NOT here.
+        """
+        return {
+            "id": task.id,
+            "title": task.title,
+            "body": task.body,
+            "assignee": task.assignee,
+            "status": task.status,
+            "priority": int(task.priority or 0),
+            "created_by": task.created_by,
+            "created_at": task.created_at,
+            "started_at": task.started_at,
+            "completed_at": task.completed_at,
+            "workspace_kind": task.workspace_kind,
+            "workspace_path": task.workspace_path,
+            "tenant": task.tenant,
+            "result": task.result,
+            "consecutive_failures": int(task.consecutive_failures or 0),
+            "skills": list(task.skills) if task.skills else None,
+            "max_retries": task.max_retries,
+            "max_runtime_seconds": task.max_runtime_seconds,
+        }
+
+    async def _handle_kanban_list_boards(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET /api/kanban/boards — list every board on disk."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        unavail = self._check_kanban_available()
+        if unavail:
+            return unavail
+        include_archived = (
+            request.query.get("include_archived", "").lower() in ("1", "true")
+        )
+        try:
+            boards = _kanban_db.list_boards(include_archived=include_archived)
+            return web.json_response({"boards": boards})
+        except Exception as exc:
+            logger.exception("GET /api/kanban/boards failed")
+            return _api_json_error(str(exc), status=500)
+
+    async def _handle_kanban_create_board(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /api/kanban/boards — create a new board.
+
+        Body: ``{"slug": "...", "name": "...", "description": "...",
+                  "icon": "...", "color": "..."}``. Idempotent — an
+        existing board with the same slug returns its current metadata.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        unavail = self._check_kanban_available()
+        if unavail:
+            return unavail
+        try:
+            body = await request.json()
+        except Exception:
+            return _api_json_error("Body must be valid JSON")
+        slug = (body.get("slug") or "").strip()
+        if not slug:
+            return _api_json_error("Board slug is required")
+        try:
+            meta = _kanban_db.create_board(
+                slug,
+                name=(body.get("name") or None),
+                description=(body.get("description") or None),
+                icon=(body.get("icon") or None),
+                color=(body.get("color") or None),
+            )
+            return web.json_response({"board": meta})
+        except ValueError as exc:
+            return _api_json_error(str(exc), status=400)
+        except Exception as exc:
+            logger.exception("POST /api/kanban/boards failed")
+            return _api_json_error(str(exc), status=500)
+
+    async def _handle_kanban_delete_board(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """DELETE /api/kanban/boards/{slug} — archive or delete a board.
+
+        Default behaviour archives (moves the directory under
+        ``_archived/``). Pass ``?archive=false`` to delete outright.
+        The ``default`` board cannot be removed.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        unavail = self._check_kanban_available()
+        if unavail:
+            return unavail
+        slug = request.match_info.get("slug", "")
+        archive = (
+            request.query.get("archive", "true").lower() not in ("0", "false")
+        )
+        try:
+            summary = _kanban_db.remove_board(slug, archive=archive)
+            return web.json_response(summary)
+        except ValueError as exc:
+            return _api_json_error(str(exc), status=400)
+        except Exception as exc:
+            logger.exception("DELETE /api/kanban/boards/%s failed", slug)
+            return _api_json_error(str(exc), status=500)
+
+    async def _handle_kanban_list_tasks(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET /api/kanban/tasks — list tasks for a board.
+
+        Query params: ``board``, ``status``, ``assignee``,
+        ``include_archived``, ``limit``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        unavail = self._check_kanban_available()
+        if unavail:
+            return unavail
+        board = request.query.get("board") or None
+        status = request.query.get("status") or None
+        assignee = request.query.get("assignee") or None
+        include_archived = (
+            request.query.get("include_archived", "").lower() in ("1", "true")
+        )
+        try:
+            limit = int(request.query.get("limit", 0)) or None
+        except (TypeError, ValueError):
+            limit = None
+        try:
+            conn = _kanban_db.connect(board=board)
+            try:
+                tasks = _kanban_db.list_tasks(
+                    conn,
+                    assignee=assignee,
+                    status=status,
+                    include_archived=include_archived,
+                    limit=limit,
+                )
+            finally:
+                conn.close()
+            return web.json_response(
+                {"tasks": [self._serialise_kanban_task(t) for t in tasks]}
+            )
+        except ValueError as exc:
+            return _api_json_error(str(exc), status=400)
+        except Exception as exc:
+            logger.exception("GET /api/kanban/tasks failed")
+            return _api_json_error(str(exc), status=500)
+
+    async def _handle_kanban_create_task(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /api/kanban/tasks — create a task.
+
+        Body: ``{"title": "...", "body": "...", "assignee": "...",
+                  "priority": 0, "skills": [...], "triage": false,
+                  "board": "..."}``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        unavail = self._check_kanban_available()
+        if unavail:
+            return unavail
+        try:
+            body = await request.json()
+        except Exception:
+            return _api_json_error("Body must be valid JSON")
+        title = (body.get("title") or "").strip()
+        if not title:
+            return _api_json_error("Task title is required")
+        board = body.get("board") or None
+        try:
+            conn = _kanban_db.connect(board=board)
+            try:
+                task_id = _kanban_db.create_task(
+                    conn,
+                    title=title,
+                    body=body.get("body") or None,
+                    assignee=body.get("assignee") or None,
+                    created_by=body.get("created_by") or "api",
+                    priority=int(body.get("priority") or 0),
+                    triage=bool(body.get("triage", False)),
+                    skills=body.get("skills") or None,
+                    max_retries=body.get("max_retries"),
+                    max_runtime_seconds=body.get("max_runtime_seconds"),
+                    idempotency_key=(
+                        request.headers.get("Idempotency-Key")
+                        or body.get("idempotency_key")
+                        or None
+                    ),
+                )
+                task = _kanban_db.get_task(conn, task_id)
+            finally:
+                conn.close()
+            if task is None:
+                return _api_json_error("Task creation failed", status=500)
+            return web.json_response(
+                {"task": self._serialise_kanban_task(task)}
+            )
+        except ValueError as exc:
+            return _api_json_error(str(exc), status=400)
+        except Exception as exc:
+            logger.exception("POST /api/kanban/tasks failed")
+            return _api_json_error(str(exc), status=500)
+
+    async def _handle_kanban_archive_task(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """DELETE /api/kanban/tasks/{task_id} — archive a task."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        unavail = self._check_kanban_available()
+        if unavail:
+            return unavail
+        task_id = request.match_info.get("task_id", "")
+        if not task_id:
+            return _api_json_error("Task id is required")
+        board = request.query.get("board") or None
+        try:
+            conn = _kanban_db.connect(board=board)
+            try:
+                ok = _kanban_db.archive_task(conn, task_id)
+            finally:
+                conn.close()
+            if not ok:
+                return _api_json_error("Task not found", status=404)
+            return web.json_response({"task_id": task_id, "archived": True})
+        except Exception as exc:
+            logger.exception("DELETE /api/kanban/tasks/%s failed", task_id)
+            return _api_json_error(str(exc), status=500)
+
+    async def _handle_kanban_complete_task(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /api/kanban/tasks/{task_id}/complete — mark done.
+
+        Optional body: ``{"result": "...", "summary": "...",
+        "board": "..."}``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        unavail = self._check_kanban_available()
+        if unavail:
+            return unavail
+        task_id = request.match_info.get("task_id", "")
+        if not task_id:
+            return _api_json_error("Task id is required")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        board = body.get("board") or request.query.get("board") or None
+        try:
+            conn = _kanban_db.connect(board=board)
+            try:
+                ok = _kanban_db.complete_task(
+                    conn,
+                    task_id,
+                    result=body.get("result") or None,
+                    summary=body.get("summary") or None,
+                )
+                task = _kanban_db.get_task(conn, task_id) if ok else None
+            finally:
+                conn.close()
+            if not ok or task is None:
+                return _api_json_error(
+                    "Task not found or not in a completable state",
+                    status=404,
+                )
+            return web.json_response(
+                {"task": self._serialise_kanban_task(task)}
+            )
+        except ValueError as exc:
+            return _api_json_error(str(exc), status=400)
+        except Exception as exc:
+            logger.exception(
+                "POST /api/kanban/tasks/%s/complete failed", task_id
+            )
+            return _api_json_error(str(exc), status=500)
+
+    # ------------------------------------------------------------------
     # Cron jobs API
     # ------------------------------------------------------------------
 
@@ -4699,6 +5019,14 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/api/usage/summary", self._handle_usage_summary)
             # Recent structural events for a remote activity feed
             self._app.router.add_get("/api/events/recent", self._handle_recent_events)
+            # Kanban boards + tasks (light CRUD)
+            self._app.router.add_get("/api/kanban/boards", self._handle_kanban_list_boards)
+            self._app.router.add_post("/api/kanban/boards", self._handle_kanban_create_board)
+            self._app.router.add_delete("/api/kanban/boards/{slug}", self._handle_kanban_delete_board)
+            self._app.router.add_get("/api/kanban/tasks", self._handle_kanban_list_tasks)
+            self._app.router.add_post("/api/kanban/tasks", self._handle_kanban_create_task)
+            self._app.router.add_delete("/api/kanban/tasks/{task_id}", self._handle_kanban_archive_task)
+            self._app.router.add_post("/api/kanban/tasks/{task_id}/complete", self._handle_kanban_complete_task)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
