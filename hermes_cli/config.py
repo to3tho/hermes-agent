@@ -294,8 +294,17 @@ def get_container_exec_info() -> Optional[dict]:
 from hermes_constants import get_hermes_home  # noqa: F811,E402
 from utils import atomic_replace
 
-def get_config_path() -> Path:
-    """Get the main config file path."""
+def get_config_path(profile_dir: Optional[Path] = None) -> Path:
+    """Get the main config file path.
+
+    With ``profile_dir`` (Path), returns ``<profile_dir>/config.yaml``
+    so callers operating on a specific profile (e.g. the per-profile
+    `/api/tools/toolsets?profile=<name>` handler) don't have to fight
+    the process-wide ``HERMES_HOME`` env-var. Without it, behaviour
+    is unchanged: ``get_hermes_home() / "config.yaml"``.
+    """
+    if profile_dir is not None:
+        return profile_dir / "config.yaml"
     return get_hermes_home() / "config.yaml"
 
 def get_env_path() -> Path:
@@ -4020,7 +4029,7 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
 
 
 
-def read_raw_config() -> Dict[str, Any]:
+def read_raw_config(profile_dir: Optional[Path] = None) -> Dict[str, Any]:
     """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
 
     Returns the raw YAML dict, or ``{}`` if the file doesn't exist or can't
@@ -4031,10 +4040,15 @@ def read_raw_config() -> Dict[str, Any]:
     Cached on the config file's (mtime_ns, size) — same strategy as
     ``load_config()``. Returns a deepcopy on every call since some callers
     mutate the result before passing to ``save_config()``.
+
+    ``profile_dir`` (optional): when provided, reads
+    ``<profile_dir>/config.yaml`` instead of the process-default
+    ``get_config_path()``. The cache is keyed on the resolved path so
+    a per-profile read and a default read coexist cleanly.
     """
     with _CONFIG_LOCK:
         try:
-            config_path = get_config_path()
+            config_path = get_config_path(profile_dir)
             st = config_path.stat()
             cache_key = (st.st_mtime_ns, st.st_size)
         except (FileNotFoundError, OSError):
@@ -4058,7 +4072,7 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
-def load_config() -> Dict[str, Any]:
+def load_config(profile_dir: Optional[Path] = None) -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml.
 
     Cached on the config file's (mtime_ns, size). Returns a deepcopy of
@@ -4067,10 +4081,20 @@ def load_config() -> Dict[str, Any]:
     The cache is keyed on ``str(config_path)`` so profile switches
     (which change ``HERMES_HOME`` and therefore ``get_config_path()``)
     don't collide.
+
+    ``profile_dir`` (optional): when provided, loads
+    ``<profile_dir>/config.yaml`` instead of the process-default
+    ``get_config_path()``. Used by `/api/tools/toolsets?profile=…` to
+    operate on the targeted profile's config without restarting the
+    gateway process.
     """
     with _CONFIG_LOCK:
-        ensure_hermes_home()
-        config_path = get_config_path()
+        if profile_dir is None:
+            # Only ensure the default Hermes home when we're operating
+            # on it; for a specific profile_dir the caller (typically
+            # `_resolve_profile_dir`) has already validated it exists.
+            ensure_hermes_home()
+        config_path = get_config_path(profile_dir)
         path_key = str(config_path)
 
         try:
@@ -4186,19 +4210,28 @@ _COMMENTED_SECTIONS = """
 """
 
 
-def save_config(config: Dict[str, Any]):
-    """Save configuration to ~/.hermes/config.yaml."""
+def save_config(config: Dict[str, Any], profile_dir: Optional[Path] = None):
+    """Save configuration to ~/.hermes/config.yaml.
+
+    ``profile_dir`` (optional): when provided, writes
+    ``<profile_dir>/config.yaml`` instead of the process-default
+    ``get_config_path()``. Used by `/api/tools/toolsets?profile=…`
+    so a toolset toggle on the `mira-uitest` profile lands in
+    `~/.hermes/profiles/mira-uitest/config.yaml`, not in the
+    gateway's HERMES_HOME-pinned default.
+    """
     with _CONFIG_LOCK:
         if is_managed():
             managed_error("save configuration")
             return
         from utils import atomic_yaml_write
 
-        ensure_hermes_home()
-        config_path = get_config_path()
+        if profile_dir is None:
+            ensure_hermes_home()
+        config_path = get_config_path(profile_dir)
         current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         normalized = current_normalized
-        raw_existing = _normalize_root_model_keys(_normalize_max_turns_config(read_raw_config()))
+        raw_existing = _normalize_root_model_keys(_normalize_max_turns_config(read_raw_config(profile_dir)))
         if raw_existing:
             normalized = _preserve_env_ref_templates(
                 normalized,
