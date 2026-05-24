@@ -1185,11 +1185,24 @@ def _get_platform_tools(
     return enabled_toolsets
 
 
-def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[str]):
+def _save_platform_tools(
+    config: dict,
+    platform: str,
+    enabled_toolset_keys: Set[str],
+    profile_dir: "Optional[Path]" = None,
+):
     """Save the selected toolset keys for a platform to config.
 
     Preserves any non-configurable toolset entries (like MCP server names)
     that were already in the config for this platform.
+
+    ``profile_dir`` (optional): when provided, the final ``save_config``
+    writes to that profile's ``config.yaml`` instead of the
+    HERMES_HOME-pinned default. Used by
+    ``/api/tools/toolsets?profile=<name>`` so a toggle on the
+    `mira-uitest` profile lands in
+    `~/.hermes/profiles/mira-uitest/config.yaml` instead of the
+    gateway process default.
     """
     config.setdefault("platform_toolsets", {})
 
@@ -1238,7 +1251,7 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
         config.setdefault("known_plugin_toolsets", {})
         config["known_plugin_toolsets"][platform] = sorted(plugin_keys)
 
-    save_config(config)
+    save_config(config, profile_dir)
 
 
 def _toolset_has_keys(ts_key: str, config: dict = None) -> bool:
@@ -2649,14 +2662,26 @@ def _configure_mcp_tools_interactive(config: dict):
 # ─── Non-interactive disable/enable ──────────────────────────────────────────
 
 
-def _apply_toolset_change(config: dict, platform: str, toolset_names: List[str], action: str):
-    """Add or remove built-in toolsets for a platform."""
+def _apply_toolset_change(
+    config: dict,
+    platform: str,
+    toolset_names: List[str],
+    action: str,
+    profile_dir: "Optional[Path]" = None,
+):
+    """Add or remove built-in toolsets for a platform.
+
+    ``profile_dir`` (optional): forwarded to ``_save_platform_tools``
+    so the persisted ``config.yaml`` lands in the targeted profile
+    directory rather than the process-default. See the
+    ``_save_platform_tools`` docstring for the motivation.
+    """
     enabled = _get_platform_tools(config, platform, include_default_mcp_servers=False)
     if action == "disable":
         updated = enabled - set(toolset_names)
     else:
         updated = enabled | set(toolset_names)
-    _save_platform_tools(config, platform, updated)
+    _save_platform_tools(config, platform, updated, profile_dir)
 
 
 def _apply_mcp_change(config: dict, targets: List[str], action: str) -> Set[str]:

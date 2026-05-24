@@ -3540,7 +3540,7 @@ class APIServerAdapter(BasePlatformAdapter):
         platform = request.query.get("platform") or "api_server"
         enabled = bool(body.get("enabled"))
         try:
-            from hermes_cli.config import load_config, save_config
+            from hermes_cli.config import load_config
             from hermes_cli.tools_config import _apply_toolset_change
 
             profile_query = request.query.get("profile")
@@ -3550,8 +3550,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 else None
             )
             config = load_config(profile_dir)
-            _apply_toolset_change(config, platform, [key], "enable" if enabled else "disable")
-            save_config(config, profile_dir)
+            # _apply_toolset_change → _save_platform_tools →
+            # save_config(config, profile_dir) — the helper persists
+            # for us. No extra save_config() call here (would
+            # double-write).
+            _apply_toolset_change(
+                config,
+                platform,
+                [key],
+                "enable" if enabled else "disable",
+                profile_dir,
+            )
             return web.json_response({
                 "ok": True,
                 "key": key,
